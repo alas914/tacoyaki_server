@@ -1,4 +1,4 @@
-// 계정별 캐릭터 시트 영속 . 서버는 시트 내용을 해석하지 않고 불투명 블롭으로 저장한다
+// 계정별 캐릭터 시트 영속. 서버는 시트 내용을 해석하지 않고 불투명 블롭으로 저장한다
 // (도메인 타입은 렌더러 소유). <dataDir>/characters/<accountId>.json = { characters: CharacterRecord[] }.
 // auth.ts 와 동일한 파일 영속 패턴(원자적 쓰기) + 계정별 인메모리 캐시.
 import { readFileSync, writeFileSync, mkdirSync, renameSync, existsSync, readdirSync } from 'node:fs'

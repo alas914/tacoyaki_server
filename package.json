@@ -2,11 +2,10 @@
   "name": "tacoyaki-box-server",
   "version": "0.1.0",
   "private": true,
-  "description": "타코야키 박스 멀티플레이 릴레이 서버 (Socket.IO)",
+  "description": "타코야키 박스 멀티플레이 릴레이 서버 (Socket.IO, 서버 권위 다이스)",
   "type": "module",
   "main": "src/index.ts",
   "scripts": {
-    "dev": "tsx watch src/index.ts",
     "start": "tsx src/index.ts",
     "typecheck": "tsc --noEmit"
   },

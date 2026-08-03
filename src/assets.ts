@@ -17,6 +17,27 @@ const ASSET_REF_RE = /asset:([a-f0-9]{64})/g
 /** 미참조 자산 청소 시, 막 업로드돼 아직 어디에도 박히지 않은 자산을 지우지 않기 위한 유예(기본 1시간). */
 const DEFAULT_SWEEP_GRACE_MS = 60 * 60 * 1000
 
+/** 자산으로 저장을 허용하는 MIME 대분류 — 이 프로그램이 올리는 것은 이미지·음원·영상·폰트뿐이다. */
+const MIME_FAMILY_RE = /^(image|audio|video|font)\/[\w.+-]+$/
+/**
+ * 문서로 해석될 수 있는 타입은 전부 차단한다. 자산은 API·웹판과 같은 오리진에서 서빙되므로,
+ * 'text/html' 로 저장된 자산이 브라우저에서 문서로 열리면 그 오리진의 저장소(로그인 토큰)에 접근할 수 있다.
+ * svg 는 확장자만 이미지일 뿐 스크립트를 품을 수 있어 같은 이유로 제외한다.
+ */
+const MIME_DENY_RE = /^image\/svg/i
+
+/**
+ * 업로드 MIME 정규화 — 허용 목록 밖은 'application/octet-stream' 으로 강등한다(거부가 아니라 강등:
+ * 알 수 없는 타입도 저장은 되되 문서로 해석되지 않는다). 서빙 시 선언 타입이 그대로 나가므로 여기가 유일한 관문이다.
+ */
+export function safeAssetMime(mime: unknown): string {
+  if (typeof mime !== 'string') return 'application/octet-stream'
+  // 'audio/mpeg; codecs=…' 처럼 파라미터가 붙어 오는 경우가 있어 앞부분만 본다.
+  const base = mime.split(';')[0].trim().toLowerCase()
+  if (!MIME_FAMILY_RE.test(base) || MIME_DENY_RE.test(base)) return 'application/octet-stream'
+  return base
+}
+
 /** 임의 직렬화 문자열에서 'asset:<해시>' 참조를 모두 뽑아 into 에 추가(GC 라이브 집합 수집 — 방·캐릭터·계정 공용). */
 export function collectAssetRefs(text: string, into: Set<string>): void {
   if (!text) return
@@ -67,7 +88,8 @@ export function createAssetStore(opts?: { dataDir?: string; persist?: boolean })
       mkdirSync(dir, { recursive: true })
       if (existsSync(indexPath)) {
         const obj = JSON.parse(readFileSync(indexPath, 'utf8')) as Record<string, unknown>
-        for (const [h, m] of Object.entries(obj)) if (HASH_RE.test(h) && typeof m === 'string') mimes.set(h, m)
+        // 색인을 읽을 때도 정규화한다 — 예전에 저장된 문서형 MIME 이 남아 있어도 부팅 즉시 무해해진다.
+        for (const [h, m] of Object.entries(obj)) if (HASH_RE.test(h) && typeof m === 'string') mimes.set(h, safeAssetMime(m))
       }
     } catch (e) {
       console.error('[assets] index.json 로드 실패 — 빈 색인으로 시작:', e)
@@ -106,7 +128,7 @@ export function createAssetStore(opts?: { dataDir?: string; persist?: boolean })
 
     async put(bytes, mime) {
       const hash = createHash('sha256').update(bytes).digest('hex')
-      const safeMime = typeof mime === 'string' && /^[\w.+-]+\/[\w.+-]+$/.test(mime) ? mime : 'application/octet-stream'
+      const safeMime = safeAssetMime(mime)
       if (mimes.has(hash)) {
         // 디스크 폴백으로 octet-stream 으로 잡혀 있던 항목을, 더 구체적인 MIME 으로 재업로드하면 승격(색인 보강).
         if (mimes.get(hash) === 'application/octet-stream' && safeMime !== 'application/octet-stream') {

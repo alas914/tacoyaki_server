@@ -8,7 +8,7 @@ import { randomUUID, randomBytes, scryptSync, timingSafeEqual } from 'node:crypt
 import { readFileSync, writeFileSync, mkdirSync, renameSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { collectAssetRefs as scanAssetRefs } from './assets'
-import type { ProfileLink, ProfileTheme } from './protocol'
+import type { PresenceStatus, ProfileLink, ProfileTheme } from './protocol'
 
 export type AccountRole = 'admin' | 'member' | 'guest'
 
@@ -93,7 +93,7 @@ export interface UserSummary {
   avatar?: string
 }
 
-/** 관리자 서버관리용 계정 요약(등급·가입일 포함 — admin 전용). */
+/** 관리자 서버관리용 계정 요약(등급·가입일·마지막 접속 포함 — admin 전용). */
 export interface AdminAccountInfo {
   id: string
   username: string
@@ -101,6 +101,8 @@ export interface AdminAccountInfo {
   avatar?: string
   role: AccountRole
   createdAt: number
+  /** 마지막 접속 일시(ms) — 로그인·소켓 연결/종료 시 갱신. 기능 도입 전 계정은 미기록. */
+  lastSeenAt?: number
 }
 
 /** 타인 갠홈 방문 시 보는 홈(공개 프로필 + 방명록). */
@@ -128,6 +130,23 @@ export interface LobbyCalEvent {
   text: string
   color: string
 }
+/** 공개 스티커 1개 — 바탕화면에 자유 배치한 이미지 장식(테두리·그림자 옵션). 방문 시 읽기전용 렌더. */
+export interface LobbySticker {
+  /** 좌상단 px(호스트 화면 기준). */
+  x: number
+  y: number
+  /** 표시 크기 px(비율 유지). */
+  w: number
+  h: number
+  /** 테두리 on/off + 색(hex) + 굵기(px). */
+  border: boolean
+  borderColor: string
+  borderWidth: number
+  /** 그림자 on/off. */
+  shadow: boolean
+  /** 스티커 이미지(asset 참조 또는 data URL). 없으면 스티커 자체가 무의미 → sanitize 가 제외. */
+  image?: string
+}
 /** 사용자가 공개(동기화)한 로비 스냅샷 — 다른 사람이 '로비 방문' 시 이 데이터로 읽기전용 렌더. */
 export interface LobbySnapshot {
   colors: Record<string, string>
@@ -141,6 +160,14 @@ export interface LobbySnapshot {
   iconImages: Record<string, string>
   iconPos: Record<string, { x: number; y: number }>
   iconEmojis: Record<string, string>
+  /** 아이콘 이름(라벨) 커스텀(iconId → 글자). 구버전 스냅샷엔 없음. */
+  iconLabels?: Record<string, string>
+  /** 아이콘 그림 표시 크기(iconId → px). 구버전 스냅샷엔 없음. */
+  iconSizes?: Record<string, number>
+  /** 숨긴 아이콘(iconId → true). 방문자에게도 숨긴다. 구버전 스냅샷엔 없음. */
+  hiddenIcons?: Record<string, boolean>
+  /** 바탕화면 스티커(그리는 순서 = 배열 순서 = 겹침 순서). */
+  stickers: LobbySticker[]
   updatedAt: number
 }
 
@@ -158,8 +185,23 @@ const MAX_LOBBY_DDAY_TOTAL = 5_000_000 // 디데이 이미지 합계 상한(acco
 const MAX_LOBBY_CAL_DAYS = 400 // 캘린더 일정 날짜(키) 개수 상한
 const MAX_LOBBY_CAL_PER_DAY = 20 // 한 날짜의 일정 개수 상한
 const MAX_LOBBY_CAL_TEXT = 200 // 일정 텍스트 길이 상한
+const MAX_LOBBY_STICKERS = 60 // 스티커 개수 상한
+const MAX_LOBBY_STICKER = 600_000 // 스티커 이미지 1개 상한
+const MAX_LOBBY_STICKER_TOTAL = 6_000_000 // 스티커 이미지 합계 상한(accounts.json 비대화·본문 한도 방지)
 
 /** 로비 스냅샷 정규화 — 색은 hex, 이미지는 data:image(길이 캡), 텍스트/개수 캡. CSS·저장 주입 방지. */
+/** 스냅샷에 실제로 실린 그림 수 — 통째로 빠진 사본이 멀쩡한 것을 덮지 않게 가르는 데 쓴다. */
+function countLobbyImages(l: LobbySnapshot): number {
+  return (
+    (l.wallpaper?.image ? 1 : 0) +
+    Object.keys(l.iconImages ?? {}).length +
+    (l.gallery ?? []).filter((g) => g.image).length +
+    (l.ddays ?? []).filter((d) => d.image).length +
+    (l.stickers ?? []).length +
+    (l.music ?? []).filter((m) => m.cover).length
+  )
+}
+
 function sanitizeLobby(v: unknown): LobbySnapshot | null {
   if (!v || typeof v !== 'object') return null
   const o = v as Record<string, unknown>
@@ -231,6 +273,30 @@ function sanitizeLobby(v: unknown): LobbySnapshot | null {
       if (typeof val === 'string' && val.trim()) iconEmojis[k.slice(0, 40)] = val.slice(0, 16)
     }
   }
+  // 아이콘 이름(라벨) — 텍스트 길이 캡(클라 ICON_LABEL_MAX 와 동일 24자).
+  const iconLabels: Record<string, string> = {}
+  if (o.iconLabels && typeof o.iconLabels === 'object') {
+    for (const [k, val] of Object.entries(o.iconLabels as Record<string, unknown>)) {
+      if (Object.keys(iconLabels).length >= MAX_LOBBY_ICONS) break
+      if (typeof val === 'string' && val.trim()) iconLabels[k.slice(0, 40)] = val.trim().slice(0, 24)
+    }
+  }
+  // 아이콘 그림 크기 — 숫자 clamp(클라 ICON_SIZE_MIN/MAX 와 동일 32~72).
+  const iconSizes: Record<string, number> = {}
+  if (o.iconSizes && typeof o.iconSizes === 'object') {
+    for (const [k, val] of Object.entries(o.iconSizes as Record<string, unknown>)) {
+      if (Object.keys(iconSizes).length >= MAX_LOBBY_ICONS) break
+      if (typeof val === 'number' && isFinite(val)) iconSizes[k.slice(0, 40)] = Math.min(72, Math.max(32, Math.round(val)))
+    }
+  }
+  // 숨긴 아이콘 — true 인 항목만 보존(방문자 렌더에서도 제외).
+  const hiddenIcons: Record<string, boolean> = {}
+  if (o.hiddenIcons && typeof o.hiddenIcons === 'object') {
+    for (const [k, val] of Object.entries(o.hiddenIcons as Record<string, unknown>)) {
+      if (Object.keys(hiddenIcons).length >= MAX_LOBBY_ICONS) break
+      if (val === true) hiddenIcons[k.slice(0, 40)] = true
+    }
+  }
   const ddays: LobbyDDayItem[] = []
   let ddayBudget = MAX_LOBBY_DDAY_TOTAL
   if (Array.isArray(o.ddays)) {
@@ -267,6 +333,31 @@ function sanitizeLobby(v: unknown): LobbySnapshot | null {
       if (list.length) calEvents[k] = list
     }
   }
+  // 스티커 — 이미지 필수(없으면 제외), 개수·이미지 용량(개별·합계) 캡, 좌표/크기 숫자 검증, 색 hex·굵기 clamp.
+  const stickers: LobbySticker[] = []
+  let stickerBudget = MAX_LOBBY_STICKER_TOTAL
+  const stickerNum = (v: unknown, min: number, max: number, dflt: number): number =>
+    typeof v === 'number' && isFinite(v) ? Math.min(max, Math.max(min, Math.round(v))) : dflt
+  if (Array.isArray(o.stickers)) {
+    for (const st of o.stickers as Record<string, unknown>[]) {
+      if (stickers.length >= MAX_LOBBY_STICKERS) break
+      if (!st || typeof st !== 'object') continue
+      const image = lobbyImageRef(st.image, MAX_LOBBY_STICKER)
+      if (!image || image.length > stickerBudget) continue // 이미지 없거나 합계 예산 초과 → 제외(메타만은 무의미)
+      stickerBudget -= image.length
+      stickers.push({
+        x: stickerNum(st.x, -4000, 20000, 0),
+        y: stickerNum(st.y, -4000, 20000, 0),
+        w: stickerNum(st.w, 8, 4000, 160),
+        h: stickerNum(st.h, 8, 4000, 160),
+        border: st.border === true,
+        borderColor: hexColor(st.borderColor) ?? '#ffffff',
+        borderWidth: stickerNum(st.borderWidth, 0, 40, 0),
+        shadow: st.shadow !== false, // 기본 켬(명시적 false 일 때만 끔)
+        image
+      })
+    }
+  }
   return {
     colors,
     wallpaper,
@@ -278,6 +369,10 @@ function sanitizeLobby(v: unknown): LobbySnapshot | null {
     iconImages,
     iconPos,
     iconEmojis,
+    iconLabels,
+    iconSizes,
+    hiddenIcons,
+    stickers,
     updatedAt: Date.now()
   }
 }
@@ -313,6 +408,11 @@ export interface Account {
   friendReqIn?: string[]
   /** 내가 보낸 친구 신청(상대 userId). */
   friendReqOut?: string[]
+  /** 수동 프레즌스 상태(미설정=online). invisible 은 재접속 후에도 유지.
+   *  PublicAccount 에는 절대 싣지 않는다 — /home 등으로 새면 '오프라인 표시' 위장이 무력화된다. */
+  status?: PresenceStatus
+  /** 마지막 접속 일시(ms) — 로그인 성공·소켓 연결/종료 시 갱신(관리자 서버관리 표시용). */
+  lastSeenAt?: number
 }
 
 /** 외부로 노출하는 안전한 계정 정보(해시·솔트 제외). */
@@ -397,12 +497,39 @@ export interface AuthStore {
   ): { ok: true; accountId: string; affectedFriends: string[] } | { ok: false; error: string }
   getAccountById(id: string): PublicAccount | null
   /**
+   * 본인 비밀번호 변경 — 토큰 + 현재 비밀번호 재확인. 성공하면 이 토큰만 남기고 나머지 세션을 끊는다
+   * (비밀번호를 바꾸는 이유가 보통 '다른 기기/사람을 내보내려는 것'이라 남은 세션을 살려 두면 의미가 없다).
+   */
+  changePassword(
+    token: string,
+    current: string,
+    next: string
+  ): { ok: true; accountId: string } | { ok: false; error: string }
+  /**
+   * 관리자 이양 — 지금 관리자가 다른 계정에게 관리자를 넘기고 본인은 member 가 된다(관리자는 항상 1명).
+   * 대상은 손님이 아니어야 한다(승인부터 하고 넘기게). 서버를 연 사람이 실수로 먼저 로그인해 관리자가 된 경우를 푼다.
+   * 권한 검사(요청자=admin)는 호출 측 relay 가 수행한다.
+   */
+  transferAdmin(
+    fromId: string,
+    toId: string
+  ): { ok: true; from: PublicAccount; to: PublicAccount } | { ok: false; error: string }
+  /**
    * 관리자: 대상 계정 등급 변경(member↔guest). admin 은 부트스트랩 전용이라 대상이 admin 이거나 목표가 admin 이면 거부.
    * 권한 검사(요청자=admin)는 호출 측 relay 가 수행한다. 성공 시 갱신된 공개 계정을 반환.
    */
   setRole(targetId: string, role: AccountRole): ProfileResult
-  /** 관리자 서버관리 — 전체 계정 요약(등급·가입일·아바타). 가입 순(오래된 순). */
+  /**
+   * 관리자: 대상 계정의 로그인 아이디(username) 변경. 길이(2자 이상)·중복(대소문자·공백 무시, 본인 제외) 검증 후 갱신.
+   * id(내부 UUID)는 그대로라 다른 저장소(방·캐릭터·DM·블로그·친구) 연쇄 변경은 없다. 권한 검사(요청자=admin)는
+   * 호출 측 relay 가 수행한다. 성공 시 갱신된 공개 계정을 반환.
+   */
+  setUsername(targetId: string, newUsername: string): ProfileResult
+  /** 관리자 서버관리 — 전체 계정 요약(등급·가입일·아바타·마지막 접속). 가입 순(오래된 순). */
   listForAdmin(): AdminAccountInfo[]
+  /** 마지막 접속 일시 갱신 — 로그인·소켓 연결/종료 시 호출. 메모리는 즉시, 디스크 저장은
+   *  직전 기록과 60초 이상 차이날 때만(잦은 재접속에도 accounts.json 쓰기 폭주 방지). */
+  touchSeen(accountId: string): void
   /**
    * 관리자 용량 산출 — 로비 스냅샷(공개 꾸밈, '로비 초기화'가 지우는 범위)과 프로필(아바타·배너·소개·방명록)을
    * 분리한 직렬화 바이트 + 참조 자산 해시. '로비' 컬럼과 초기화 회수 범위를 일치시키기 위함.
@@ -429,6 +556,10 @@ export interface AuthStore {
   friendList(token: string): FriendListResult
   /** 토큰 소유 계정의 프로필(닉네임·사진·소개) 부분 갱신. */
   updateProfile(token: string, patch: ProfilePatch): ProfileResult
+  /** 수동 프레즌스 상태 저장(계정 영속). 무효 값/계정 없음이면 false. */
+  setStatus(accountId: string, status: PresenceStatus): boolean
+  /** 저장된 수동 프레즌스 상태(미설정=undefined=online). */
+  getStatus(accountId: string): PresenceStatus | undefined
   /** 갠홈 둘러보기 — 전체 사용자 공개 요약(닉네임순). */
   listUsers(): UserSummary[]
   /** 타인/내 갠홈 보기 — 공개 프로필 + 방명록. 없는 id 면 null. */
@@ -437,8 +568,12 @@ export interface AuthStore {
   addGuestbookEntry(token: string, targetUserId: string, message: string): GuestbookResult
   /** 방명록 글 삭제 — 홈 주인 또는 작성자만. 갱신된 방명록 반환. */
   removeGuestbookEntry(token: string, targetUserId: string, entryId: string): GuestbookResult
-  /** 내 로비 스냅샷 공개(동기화) — 토큰 인증. 정규화 후 저장. */
-  setLobby(token: string, snapshot: unknown): LobbyResult
+  /**
+   * 내 로비 스냅샷 공개(동기화) — 토큰 인증. 정규화 후 저장.
+   * refCount 는 보내는 기기가 '가지고 있다고 아는 그림 수'다. 그림이 하나도 안 실린 사본이 왔는데
+   * 그 기기가 그림을 가지고 있다고 말하면, 읽지 못했을 뿐이므로 덮지 않는다.
+   */
+  setLobby(token: string, snapshot: unknown, refCount?: number): LobbyResult
   /** 타인/내 로비 스냅샷 조회(공개). 없으면 null. */
   getLobby(userId: string): LobbySnapshot | null
   /** 전 계정(아바타·배너·로비 스냅샷 등)에서 참조 중인 'asset:<해시>' 수집(자산 GC 라이브 집합). */
@@ -515,6 +650,22 @@ export function createAuthStore(opts?: {
     } catch (e) {
       console.error('[auth] 계정 저장 실패:', e)
     }
+  }
+
+  // 마지막 접속 기록 — 메모리는 즉시 갱신, 파일 쓰기는 전역 1회로 뭉친다(60초 트레일링).
+  // accounts.json 은 아바타·배너·로비 스냅샷까지 담겨 수 MB 가 될 수 있어, 재접속 폭주 때 계정 수만큼
+  // 전체 동기 쓰기가 몰리지 않게 한다. 표시용 정보라 최대 1분 지연 저장(비정상 종료 시 그만큼 유실)은 무해.
+  let seenSaveTimer: NodeJS.Timeout | null = null
+  function touchSeen(accountId: string): void {
+    const a = accounts.find((x) => x.id === accountId)
+    if (!a) return
+    a.lastSeenAt = Date.now()
+    if (!persist || seenSaveTimer) return // 이미 예약된 저장이 이 갱신도 함께 실어 간다
+    seenSaveTimer = setTimeout(() => {
+      seenSaveTimer = null
+      save()
+    }, 60_000)
+    seenSaveTimer.unref() // 대기 중 저장이 프로세스 종료(테스트 러너 포함)를 붙잡지 않게
   }
 
   const pub = (a: Account): PublicAccount => ({
@@ -644,6 +795,7 @@ export function createAuthStore(opts?: {
         return fail
       }
       loginAttempts.delete(key) // 성공 시 카운터 초기화
+      touchSeen(account.id) // 마지막 접속 기록(관리자 서버관리 표시)
       return { ok: true, token: issue(account), account: pub(account) }
     },
 
@@ -689,12 +841,64 @@ export function createAuthStore(opts?: {
       return a ? pub(a) : null
     },
 
+    changePassword(token, current, next) {
+      const id = accountIdForToken(token)
+      if (!id) return { ok: false, error: '로그인이 필요합니다.' }
+      const a = accounts.find((x) => x.id === id)
+      if (!a) return { ok: false, error: '계정을 찾을 수 없습니다.' }
+      // 현재 비밀번호 재확인(타이밍 세이프) — 토큰만으로는 부족(자리를 비운 사이 바꿔치기 방지).
+      const attempt = Buffer.from(hashPassword(current ?? '', a.salt), 'hex')
+      const stored = Buffer.from(a.hash, 'hex')
+      if (attempt.length !== stored.length || !timingSafeEqual(attempt, stored)) {
+        return { ok: false, error: '현재 비밀번호가 올바르지 않습니다.' }
+      }
+      const pw = typeof next === 'string' ? next : ''
+      if (pw.length < 4) return { ok: false, error: '새 비밀번호는 4자 이상이어야 합니다.' }
+      if (pw === current) return { ok: false, error: '지금 쓰는 비밀번호와 같습니다.' }
+      // 소금(salt)도 새로 뽑는다 — 옛 해시로 만든 사전 계산이 새 비밀번호에 재사용되지 않게.
+      a.salt = randomBytes(16).toString('hex')
+      a.hash = hashPassword(pw, a.salt)
+      // 지금 쓰는 세션만 남기고 나머지는 끊는다(다른 기기·다른 사람 로그아웃).
+      for (const [tok, s] of sessions) if (s.accountId === id && tok !== token) sessions.delete(tok)
+      save()
+      return { ok: true, accountId: id }
+    },
+
+    transferAdmin(fromId, toId) {
+      if (!toId || fromId === toId) return { ok: false, error: '자기 자신에게는 넘길 수 없습니다.' }
+      const from = accounts.find((x) => x.id === fromId)
+      const to = accounts.find((x) => x.id === toId)
+      if (!from || from.role !== 'admin') return { ok: false, error: '관리자만 이양할 수 있습니다.' }
+      if (!to) return { ok: false, error: '대상 계정을 찾을 수 없습니다.' }
+      if (to.role === 'guest') {
+        return { ok: false, error: '승인 대기(손님) 계정에는 넘길 수 없습니다. 먼저 멤버로 승인해 주세요.' }
+      }
+      to.role = 'admin'
+      from.role = 'member'
+      save()
+      return { ok: true, from: pub(from), to: pub(to) }
+    },
+
     setRole(targetId, role) {
       const a = accounts.find((x) => x.id === targetId)
       if (!a) return { ok: false, error: '대상 계정을 찾을 수 없습니다.' }
       if (a.role === 'admin') return { ok: false, error: '관리자 등급은 변경할 수 없습니다.' }
       if (role !== 'member' && role !== 'guest') return { ok: false, error: '허용되지 않는 등급입니다.' }
       a.role = role
+      save()
+      return { ok: true, account: pub(a) }
+    },
+
+    setUsername(targetId, newUsername) {
+      const a = accounts.find((x) => x.id === targetId)
+      if (!a) return { ok: false, error: '대상 계정을 찾을 수 없습니다.' }
+      const name = (newUsername ?? '').trim().slice(0, 40)
+      if (name.length < 2) return { ok: false, error: '아이디는 2자 이상이어야 합니다.' }
+      // 다른 계정이 같은 아이디(정규화 비교)를 쓰면 거부 — 본인은 대소문자/공백만 바꾸는 것은 허용.
+      if (accounts.some((x) => x.id !== targetId && normUser(x.username) === normUser(name))) {
+        return { ok: false, error: '이미 사용 중인 아이디입니다.' }
+      }
+      a.username = name
       save()
       return { ok: true, account: pub(a) }
     },
@@ -707,10 +911,13 @@ export function createAuthStore(opts?: {
           nickname: a.nickname,
           avatar: a.avatar,
           role: a.role,
-          createdAt: a.createdAt
+          createdAt: a.createdAt,
+          lastSeenAt: a.lastSeenAt
         }))
         .sort((x, y) => x.createdAt - y.createdAt)
     },
+
+    touchSeen,
 
     usageForUser(userId) {
       const a = accounts.find((x) => x.id === userId)
@@ -863,6 +1070,22 @@ export function createAuthStore(opts?: {
       return { ok: true, account: pub(a) }
     },
 
+    setStatus(accountId, status) {
+      if (!['online', 'away', 'session', 'invisible'].includes(status)) return false
+      const a = accounts.find((x) => x.id === accountId)
+      if (!a) return false
+      // 기본값(online)은 필드 자체를 지워 accounts.json 을 가볍게 유지.
+      const next = status === 'online' ? undefined : status
+      if (a.status === next) return true // 무변경이면 저장 생략 — 같은 상태 반복 emit 이 동기 전체쓰기를 유발하지 않게
+      a.status = next
+      save()
+      return true
+    },
+
+    getStatus(accountId) {
+      return accounts.find((x) => x.id === accountId)?.status
+    },
+
     listUsers() {
       return accounts
         .map((a) => ({ id: a.id, username: a.username, nickname: a.nickname, avatar: a.avatar }))
@@ -915,13 +1138,19 @@ export function createAuthStore(opts?: {
       return { ok: true, guestbook: target.guestbook }
     },
 
-    setLobby(token, snapshot) {
+    setLobby(token, snapshot, refCount) {
       const id = accountIdForToken(token)
       if (!id) return { ok: false, error: '로그인이 필요합니다.' }
       const a = accounts.find((x) => x.id === id)
       if (!a) return { ok: false, error: '계정을 찾을 수 없습니다.' }
       const clean = sanitizeLobby(snapshot)
       if (!clean) return { ok: false, error: '잘못된 로비 데이터입니다.' }
+      // 그림이 통째로 빠진 사본이 왔다. 보낸 기기가 '그림을 가지고 있다'고 말하거나(읽지 못했을 뿐),
+      // 아무 말도 하지 않으면(옛 프로그램이라 알 수 없다) 덮지 않는다.
+      // 남의 화면에 보이던 로비가 한순간에 지워지는 사고는 되돌릴 방법이 없다.
+      if (a.lobby && countLobbyImages(a.lobby) > 0 && countLobbyImages(clean) === 0 && refCount !== 0) {
+        return { ok: false, error: '그림이 빠진 로비로 덮을 수 없습니다. 그림이 제대로 보이는 기기에서 보내 주세요.' }
+      }
       a.lobby = clean
       save()
       return { ok: true }
